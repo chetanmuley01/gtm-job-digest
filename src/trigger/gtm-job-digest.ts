@@ -73,6 +73,16 @@ function isRelevantTitle(title: string): boolean {
   return /\bgtm\b/.test(t) || /go[- ]to[- ]market/.test(t) || (/\bgrowth\b/.test(t) && /\bengineer/.test(t));
 }
 
+// Many "remote" listings are only remote-within-a-country (e.g. "United
+// States", "Brazil") — worth knowing about, but not actually open to
+// someone anywhere. Only a job with no location restriction at all (or an
+// explicit "Worldwide"/"Anywhere"/"Global" location string) is genuinely
+// open to anyone, so that's what this digest shows.
+function isWorldwideLocation(location: string): boolean {
+  const l = location.toLowerCase();
+  return l === "worldwide" || l.includes("anywhere") || l.includes("global");
+}
+
 export const gtmJobDigest = schedules.task({
   id: "gtm-job-digest",
   cron: {
@@ -178,6 +188,7 @@ async function fetchRecentJobs(): Promise<NormalizedJob[]> {
 
   for (const job of candidates) {
     if (!isRelevantTitle(job.title)) continue;
+    if (!isWorldwideLocation(job.location)) continue;
     if (job.postedAtMs < cutoff) continue;
     if (seenUrls.has(job.url)) continue;
     seenUrls.add(job.url);
@@ -225,7 +236,7 @@ function buildEmailBody(jobs: NormalizedJob[], dateStr: string): { html: string;
   const windowDays = LOOKBACK_HOURS / 24;
 
   if (jobs.length === 0) {
-    const html = `<p>No remote "GTM Engineer" (or close variant) postings found across Himalayas + Remotive + Arbeitnow in the last ${windowDays} days as of ${dateStr}.</p>`;
+    const html = `<p>No worldwide-eligible "GTM Engineer" (or close variant) postings found across Himalayas + Remotive + Arbeitnow in the last ${windowDays} days as of ${dateStr}.</p>`;
     return { html, text: html.replace(/<[^>]+>/g, "") };
   }
 
@@ -252,7 +263,7 @@ function buildEmailBody(jobs: NormalizedJob[], dateStr: string): { html: string;
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
       <h2 style="color:#111;">GTM Engineer — ${jobs.length} remote role${jobs.length === 1 ? "" : "s"} (${dateStr})</h2>
       <table width="100%" cellpadding="0" cellspacing="0">${rows}</table>
-      <p style="color:#999;font-size:12px;margin-top:20px;">Sources: Himalayas + Remotive + Arbeitnow &middot; window: last ${windowDays} days</p>
+      <p style="color:#999;font-size:12px;margin-top:20px;">Sources: Himalayas + Remotive + Arbeitnow &middot; worldwide-eligible only &middot; window: last ${windowDays} days</p>
     </div>`;
 
   const text = jobs
