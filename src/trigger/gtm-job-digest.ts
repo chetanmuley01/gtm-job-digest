@@ -2,16 +2,25 @@ import { schedules } from "@trigger.dev/sdk";
 import { Resend } from "resend";
 
 // Daily digest of remote "GTM Engineer" (and close variants) postings from
-// Remotive + Arbeitnow, emailed via Resend. Fires 9:00 AM Asia/Kolkata.
-// Test manually anytime from the Trigger.dev dashboard.
+// Himalayas + Remotive + Arbeitnow, emailed via Resend. Fires 9:00 AM
+// Asia/Kolkata. Test manually anytime from the Trigger.dev dashboard.
 //
-// Neither source's server-side `search` query param actually filters
-// (confirmed live: a real query and a gibberish query returned identical
-// results on both APIs) — so relevance is enforced entirely client-side via
-// isRelevantTitle() below. Don't rely on `search=` params from either API.
+// Himalayas (https://himalayas.app/jobs/api/search?q=...) is the primary
+// source — it's the only one of the three whose server-side query param
+// actually filters (confirmed live: "GTM Engineer" returns real matches,
+// a gibberish query returns 0). Remotive's and Arbeitnow's `search`/query
+// params were confirmed to do nothing at all (real query vs. gibberish
+// query returned identical results on both) — they're kept only as cheap
+// supplementary sources, with relevance enforced entirely client-side via
+// isRelevantTitle() for all three. Don't trust `search=`/`q=` from a new
+// source without testing it against a gibberish query first, the way this
+// was verified.
 
+const HIMALAYAS_SEARCH_URL = "https://himalayas.app/jobs/api/search?q=GTM%20Engineer&sort=recent";
+const HIMALAYAS_PAGES_TO_FETCH = 3; // ~20 results/page; covers well beyond a week of this title's volume
 const REMOTIVE_URL = "https://remotive.com/api/remote-jobs";
 const ARBEITNOW_URL = "https://www.arbeitnow.com/api/job-board-api";
+const USER_AGENT = "gtm-job-digest/1.0 (+https://github.com/chetanmuley01/gtm-job-digest)";
 
 // GTM Engineer is a niche, low-volume title, and Remotive's whole feed is
 // currently a small handful of jobs. A tight 24-48h window regularly finds
@@ -31,7 +40,15 @@ interface NormalizedJob {
   location: string;
   url: string;
   postedAtMs: number;
-  source: "Remotive" | "Arbeitnow";
+  source: "Himalayas" | "Remotive" | "Arbeitnow";
+}
+
+interface HimalayasJob {
+  title: string;
+  companyName: string;
+  applicationLink: string;
+  locationRestrictions: string[];
+  pubDate: number; // unix seconds
 }
 
 interface RemotiveJob {
@@ -81,6 +98,31 @@ export const gtmJobDigest = schedules.task({
   },
 });
 
+async function fetchHimalayasJobs(): Promise<NormalizedJob[]> {
+  const pageNumbers = Array.from({ length: HIMALAYAS_PAGES_TO_FETCH }, (_, i) => i + 1);
+  const pages = await Promise.all(
+    pageNumbers.map(async (page) => {
+      const response = await fetch(`${HIMALAYAS_SEARCH_URL}&page=${page}`, {
+        headers: { "User-Agent": USER_AGENT },
+      });
+      if (!response.ok) {
+        throw new Error(`Himalayas API returned ${response.status}: ${response.statusText} (page ${page})`);
+      }
+      const data = (await response.json()) as { jobs: HimalayasJob[] };
+      return data.jobs;
+    }),
+  );
+
+  return pages.flat().map((job) => ({
+    title: job.title,
+    company: job.companyName,
+    location: job.locationRestrictions.length === 0 ? "Worldwide" : job.locationRestrictions.join(", "),
+    url: job.applicationLink,
+    postedAtMs: job.pubDate * 1000,
+    source: "Himalayas" as const,
+  }));
+}
+
 async function fetchRemotiveJobs(): Promise<NormalizedJob[]> {
   const response = await fetch(REMOTIVE_URL);
   if (!response.ok) {
@@ -116,7 +158,7 @@ async function fetchArbeitnowJobs(): Promise<NormalizedJob[]> {
 }
 
 async function fetchRecentJobs(): Promise<NormalizedJob[]> {
-  const results = await Promise.allSettled([fetchRemotiveJobs(), fetchArbeitnowJobs()]);
+  const results = await Promise.allSettled([fetchHimalayasJobs(), fetchRemotiveJobs(), fetchArbeitnowJobs()]);
 
   const candidates: NormalizedJob[] = [];
   for (const result of results) {
@@ -127,7 +169,7 @@ async function fetchRecentJobs(): Promise<NormalizedJob[]> {
     }
   }
   if (results.every((r) => r.status === "rejected")) {
-    throw new Error("Both Remotive and Arbeitnow fetches failed");
+    throw new Error("All job source fetches failed (Himalayas, Remotive, Arbeitnow)");
   }
 
   const cutoff = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
@@ -183,7 +225,7 @@ function buildEmailBody(jobs: NormalizedJob[], dateStr: string): { html: string;
   const windowDays = LOOKBACK_HOURS / 24;
 
   if (jobs.length === 0) {
-    const html = `<p>No remote "GTM Engineer" (or close variant) postings found across Remotive + Arbeitnow in the last ${windowDays} days as of ${dateStr}.</p>`;
+    const html = `<p>No remote "GTM Engineer" (or close variant) postings found across Himalayas + Remotive + Arbeitnow in the last ${windowDays} days as of ${dateStr}.</p>`;
     return { html, text: html.replace(/<[^>]+>/g, "") };
   }
 
@@ -210,7 +252,7 @@ function buildEmailBody(jobs: NormalizedJob[], dateStr: string): { html: string;
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
       <h2 style="color:#111;">GTM Engineer — ${jobs.length} remote role${jobs.length === 1 ? "" : "s"} (${dateStr})</h2>
       <table width="100%" cellpadding="0" cellspacing="0">${rows}</table>
-      <p style="color:#999;font-size:12px;margin-top:20px;">Sources: Remotive + Arbeitnow &middot; window: last ${windowDays} days</p>
+      <p style="color:#999;font-size:12px;margin-top:20px;">Sources: Himalayas + Remotive + Arbeitnow &middot; window: last ${windowDays} days</p>
     </div>`;
 
   const text = jobs
