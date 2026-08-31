@@ -13,6 +13,10 @@ import { Resend } from "resend";
 // Bloomberry needs a real BLOOMBERRY_API_KEY (sign up at bloomberry.com/signup.html)
 // — if unset, it's skipped and the waterfall starts at Remotive.
 //
+// Only worldwide-eligible postings are shown: a "remote" listing restricted to a
+// single country (e.g. remote-within-US) isn't actually open to us, so
+// isWorldwideLocation() filters those out after each source's own fetch.
+//
 // With a 15-day lookback and a once-daily cron, a job posted near the boundary can
 // legitimately appear in two consecutive days' emails — there's no cross-run dedup
 // without a persistent store, and that's an accepted tradeoff (missing a job would
@@ -74,6 +78,16 @@ function matchesKeywords(...fields: (string | undefined)[]): boolean {
   return KEYWORD_TERMS.some((term) => haystack.includes(term));
 }
 
+// Many "remote" listings are only remote-within-a-country (e.g. "United
+// States", "Brazil") — worth knowing about, but not actually open to
+// someone anywhere. Only a job with no location restriction at all (or an
+// explicit "Worldwide"/"Anywhere"/"Global" location string) is genuinely
+// open to anyone, so that's what this digest shows.
+function isWorldwideLocation(location: string): boolean {
+  const l = location.toLowerCase();
+  return l === "worldwide" || l.includes("anywhere") || l.includes("global");
+}
+
 async function fetchViaWaterfall(): Promise<{
   jobs: NormalizedJob[];
   sourceName: string;
@@ -98,8 +112,8 @@ async function fetchViaWaterfall(): Promise<{
 
     sourcesTried.push(name);
     try {
-      const jobs = await fetchSource();
-      console.log(`${name}: found ${jobs.length} qualifying job(s) in the last ${LOOKBACK_DAYS}d`);
+      const jobs = (await fetchSource()).filter((job) => isWorldwideLocation(job.location));
+      console.log(`${name}: found ${jobs.length} worldwide-eligible job(s) in the last ${LOOKBACK_DAYS}d`);
       if (jobs.length > 0) {
         return { jobs: jobs.slice(0, MAX_JOBS_IN_EMAIL), sourceName: name, sourcesTried };
       }
@@ -118,6 +132,7 @@ interface RevealeraJob {
   title: string;
   company_name: string;
   url: string;
+  region?: string; // e.g. "United States (Remote)" — free text, not a clean restriction flag
   created_at: string; // unix seconds, as a string
   inactive?: string; // "1" if the posting is no longer active
 }
@@ -155,7 +170,7 @@ async function fetchBloomberry(): Promise<NormalizedJob[]> {
       title: job.title,
       company: job.company_name,
       url: job.url,
-      location: "Remote",
+      location: job.region || "",
       postedAt: new Date(job.postedAtMs),
       sourceName: "Bloomberry",
     }));
@@ -325,6 +340,7 @@ interface HimalayasJob {
   companyName: string;
   applicationLink: string;
   pubDate: number; // unix seconds
+  locationRestrictions: string[]; // empty = no restriction, i.e. worldwide
   categories?: string[];
   parentCategories?: string[];
 }
@@ -333,16 +349,32 @@ interface HimalayasResponse {
   jobs: HimalayasJob[];
 }
 
-async function fetchHimalayas(): Promise<NormalizedJob[]> {
-  const response = await fetch("https://himalayas.app/jobs/api?limit=100");
-  if (!response.ok) {
-    throw new Error(`Himalayas API returned ${response.status}: ${response.statusText}`);
-  }
+// Himalayas' plain browse endpoint (/jobs/api) has no keyword filter, and its
+// /search?keyword= param silently ignores the keyword too — confirmed live by
+// comparing a real query against gibberish and getting the same huge unfiltered
+// count both times. /search?q= is the one that actually filters (verified the
+// same way: a real query returns real matches, gibberish returns zero), so
+// that's what's used here, fetched across a few pages for coverage.
+const HIMALAYAS_PAGES_TO_FETCH = 3;
 
-  const data = (await response.json()) as HimalayasResponse;
+async function fetchHimalayas(): Promise<NormalizedJob[]> {
+  const pageNumbers = Array.from({ length: HIMALAYAS_PAGES_TO_FETCH }, (_, i) => i + 1);
+  const pages = await Promise.all(
+    pageNumbers.map(async (page) => {
+      const url = `https://himalayas.app/jobs/api/search?q=${encodeURIComponent(SEARCH_QUERY)}&sort=recent&page=${page}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Himalayas API returned ${response.status}: ${response.statusText} (page ${page})`);
+      }
+      const data = (await response.json()) as HimalayasResponse;
+      return data.jobs;
+    })
+  );
+
   const cutoff = cutoffDate().getTime();
 
-  return data.jobs
+  return pages
+    .flat()
     .filter((job) => matchesKeywords(job.title, ...(job.categories ?? []), ...(job.parentCategories ?? [])))
     .filter((job) => job.pubDate * 1000 >= cutoff)
     .sort((a, b) => b.pubDate - a.pubDate)
@@ -350,7 +382,7 @@ async function fetchHimalayas(): Promise<NormalizedJob[]> {
       title: job.title,
       company: job.companyName,
       url: job.applicationLink,
-      location: "Remote",
+      location: job.locationRestrictions.length === 0 ? "Worldwide" : job.locationRestrictions.join(", "),
       postedAt: new Date(job.pubDate * 1000),
       sourceName: "Himalayas",
     }));
@@ -399,7 +431,7 @@ function buildEmailBody(
   dateStr: string
 ): { html: string; text: string } {
   if (jobs.length === 0) {
-    const html = `<p>No new remote "GTM Engineer" postings found in the last ${LOOKBACK_DAYS} days as of ${dateStr}. Sources tried: ${escapeHtml(
+    const html = `<p>No worldwide-eligible "GTM Engineer" postings found in the last ${LOOKBACK_DAYS} days as of ${dateStr}. Sources tried: ${escapeHtml(
       sourcesTried.join(", ")
     )}.</p>`;
     return { html, text: html.replace(/<[^>]+>/g, "") };
@@ -429,7 +461,7 @@ function buildEmailBody(
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
       <h2 style="color:#111;">GTM Engineer — ${jobs.length} new remote roles (${dateStr})</h2>
       <table width="100%" cellpadding="0" cellspacing="0">${rows}</table>
-      <p style="color:#999;font-size:12px;margin-top:20px;">Source: ${escapeHtml(sourceName)} &middot; window: last ${LOOKBACK_DAYS}d &middot; also tried: ${escapeHtml(
+      <p style="color:#999;font-size:12px;margin-top:20px;">Source: ${escapeHtml(sourceName)} &middot; worldwide-eligible only &middot; window: last ${LOOKBACK_DAYS}d &middot; also tried: ${escapeHtml(
     sourcesTried.filter((s) => s !== sourceName).join(", ") || "none"
   )}</p>
     </div>`;
